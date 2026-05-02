@@ -137,7 +137,11 @@ async def health():
 @app.post("/analyze/doi", dependencies=[Depends(verify_key)])
 async def analyze_doi(req: DoiRequest):
     """Recibe un DOI, busca el paper y lo analiza."""
-    doi = req.doi.strip().lstrip("https://doi.org/").lstrip("doi:")
+    doi = req.doi.strip()
+    for prefix in ["https://doi.org/", "http://doi.org/", "doi.org/", "doi:"]:
+        if doi.startswith(prefix):
+            doi = doi[len(prefix):]
+            break
 
     # 1. Metadatos CrossRef
     meta = await fetch_crossref_metadata(doi)
@@ -191,3 +195,4 @@ async def analyze_text(req: TextRequest):
         result["doi"] = req.doi
     result["fuente"] = "texto_manual"
     return result
+    
