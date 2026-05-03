@@ -166,4 +166,4 @@ def sciencedirect_url(doi: str) -> str:
 def pubmed_url(pmid: str) -> str:
     """URL directa al paper en PubMed."""
     return f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
-          
+                                                
