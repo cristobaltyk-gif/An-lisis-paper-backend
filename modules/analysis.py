@@ -36,7 +36,7 @@ Analiza el artículo científico y devuelve EXCLUSIVAMENTE un JSON válido con e
 }"""
 
 
-def build_content(meta: dict, doi: str, fulltext: str | None) -> str:
+def build_content(meta: dict, doi: str, fulltext: str | None, fuente: str = "abstract") -> str:
     """Construye el contenido a enviar a Claude según disponibilidad de texto."""
     base = (
         f"DOI: {doi}\n"
