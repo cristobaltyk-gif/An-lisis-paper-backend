@@ -88,4 +88,4 @@ async def search_papers(req: SearchRequest):
         raise HTTPException(status_code=422, detail="Query demasiado corta.")
     papers = await search_pubmed(req.query, min(req.max_results, 20))
     return {"query": req.query, "total": len(papers), "papers": papers}
-        
+    
