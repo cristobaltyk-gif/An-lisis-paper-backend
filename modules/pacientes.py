@@ -61,7 +61,42 @@ REGLAS:
 
 
 class PatientRequest(BaseModel):
-    query: str  # diagnóstico o pregunta del paciente
+    query: str
+
+
+def get_client() -> anthropic.Anthropic:
+    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY no configurada.")
+    return anthropic.Anthropic(api_key=api_key)
+
+
+async def transform_query_to_pubmed(patient_query: str, client: anthropic.Anthropic) -> str:
+    """
+    Usa Claude para transformar la pregunta en lenguaje de paciente
+    a una query optimizada para PubMed en inglés.
+    """
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=100,
+        system="""Eres un experto en búsqueda de literatura médica.
+Tu única tarea es convertir la pregunta de un paciente en una query corta y precisa para buscar en PubMed.
+
+REGLAS:
+- Responde SOLO con la query, sin explicaciones ni puntuación extra
+- Máximo 6 palabras clave en inglés
+- Usa terminología médica estándar
+- Enfócate en el tema clínico principal, ignora el lenguaje coloquial
+
+Ejemplos:
+"me duele la rodilla al bajar escaleras" → "knee pain stairs osteoarthritis treatment"
+"artrosis de cadera me opero?" → "hip osteoarthritis surgical indication arthroplasty"
+"ácido hialurónico sirve para artrosis?" → "hyaluronic acid injection knee osteoarthritis efficacy"
+"cuándo debo ponerme prótesis de rodilla" → "total knee replacement indication criteria timing"
+""",
+        messages=[{"role": "user", "content": patient_query}]
+    )
+    return response.content[0].text.strip()
 
 
 async def analyze_paper_safe(paper: dict) -> dict | None:
@@ -116,54 +151,57 @@ Seguimiento: {a.get('seguimiento', 'N/A')}
 async def pacientes_chat(req: PatientRequest):
     """
     Pipeline completo para pacientes:
-    1. Busca papers en PubMed con la query del paciente
-    2. Analiza los top 3 por score con el pipeline existente
-    3. Entrega contexto a Claude para respuesta en lenguaje simple
+    1. Claude transforma pregunta del paciente a query PubMed
+    2. Busca papers en PubMed
+    3. Analiza los top 3 por score
+    4. Claude responde en lenguaje simple basado en la evidencia
     """
     query = req.query.strip()
     if len(query) < 3:
         raise HTTPException(status_code=422, detail="Query demasiado corta.")
 
-    # 1. Buscar papers
+    client = get_client()
+
+    # 1. Transformar query del paciente a query PubMed
     try:
-        papers = await search_pubmed(query, max_results=10)
+        pubmed_query = await transform_query_to_pubmed(query, client)
+        print(f"[Pacientes] Query original: '{query}' → PubMed: '{pubmed_query}'")
+    except Exception as e:
+        pubmed_query = query  # fallback a query original
+        print(f"[Pacientes] Error transformando query, usando original: {e}")
+
+    # 2. Buscar papers
+    try:
+        papers = await search_pubmed(pubmed_query, max_results=10)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error buscando papers: {e}")
 
     if not papers:
         raise HTTPException(status_code=404, detail="No se encontraron papers para esta consulta.")
 
-    # 2. Ordenar por score y tomar top 3
+    # 3. Ordenar por score y tomar top 3
     papers_sorted = sorted(papers, key=lambda p: p.get("score", 0), reverse=True)
     top_papers = papers_sorted[:3]
 
-    # 3. Analizar los 3 en paralelo
+    # 4. Analizar los 3 en paralelo
     analyses_raw = await asyncio.gather(*[analyze_paper_safe(p) for p in top_papers])
     analyses = [a for a in analyses_raw if a is not None]
 
     if not analyses:
         raise HTTPException(status_code=500, detail="No se pudo analizar ningún paper.")
 
-    # Ordenar por puntuación de calidad
     analyses.sort(key=lambda a: a.get("puntuacion_calidad", 0), reverse=True)
 
-    # 4. Construir contexto y llamar a Claude en streaming
+    # 5. Construir contexto y responder en streaming
     context = build_context_from_analyses(analyses)
-    user_message = f"""El paciente pregunta sobre: {query}
+    user_message = f"""El paciente pregunta: {query}
 
 Aquí están los {len(analyses)} papers más relevantes analizados por nuestro sistema:
 
 {context}
 
-Ahora explícale al paciente en lenguaje simple qué dice esta evidencia científica sobre su condición y tratamiento."""
+Explícale al paciente en lenguaje simple qué dice esta evidencia científica sobre su pregunta."""
 
-    api_key = os.getenv("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY no configurada.")
-
-    client = anthropic.Anthropic(api_key=api_key)
-
-    # Metadata para el frontend (papers usados)
     papers_meta = [
         {
             "titulo": a.get("titulo", ""),
@@ -177,11 +215,9 @@ Ahora explícale al paciente en lenguaje simple qué dice esta evidencia cientí
     ]
 
     def generate():
-        # Primero enviamos metadata de los papers usados
         meta_chunk = json.dumps({"type": "papers_meta", "papers": papers_meta}, ensure_ascii=False)
         yield f"data: {meta_chunk}\n\n"
 
-        # Luego streaming de la respuesta
         with client.messages.stream(
             model="claude-sonnet-4-20250514",
             max_tokens=1500,
@@ -199,4 +235,3 @@ Ahora explícale al paciente en lenguaje simple qué dice esta evidencia cientí
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
-    
