@@ -12,6 +12,7 @@ from modules.analysis import build_content, analyze
 from modules.downloader import get_fulltext
 from modules.screener import run_screener, load_screener, STREAMS
 from modules.memory import mark_as_read, get_all_read, clear_read
+from modules.pacientes import router as pacientes_router
 
 async def scheduled_screener():
     while True:
@@ -29,6 +30,7 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="EvidenciaMed API", version="4.0.0", lifespan=lifespan)
+app.include_router(pacientes_router)
 
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS,
