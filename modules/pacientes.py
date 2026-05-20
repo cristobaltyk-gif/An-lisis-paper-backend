@@ -72,10 +72,6 @@ def get_client() -> anthropic.Anthropic:
 
 
 async def transform_query_to_pubmed(patient_query: str, client: anthropic.Anthropic) -> str:
-    """
-    Usa Claude para transformar la pregunta en lenguaje de paciente
-    a una query optimizada para PubMed en inglés.
-    """
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=100,
@@ -100,7 +96,7 @@ Ejemplos:
 
 
 async def analyze_paper_safe(paper: dict) -> dict | None:
-    """Analiza un paper individual, retorna None si falla."""
+    """Analiza un paper individual, retorna None si falla. Preserva el score original."""
     try:
         doi = paper.get("doi")
         fulltext, fuente = None, "abstract"
@@ -118,6 +114,7 @@ async def analyze_paper_safe(paper: dict) -> dict | None:
 
         result = await analyze(content)
         result["fuente"] = fuente
+        result["screener_score"] = paper.get("score", 0)  # preservar score original
         return result
     except Exception as e:
         print(f"[Pacientes] Error analizando paper {paper.get('pmid')}: {e}")
@@ -125,7 +122,6 @@ async def analyze_paper_safe(paper: dict) -> dict | None:
 
 
 def build_context_from_analyses(analyses: list[dict]) -> str:
-    """Construye el contexto con los análisis para Claude."""
     parts = []
     for i, a in enumerate(analyses, 1):
         parts.append(f"""
@@ -147,28 +143,40 @@ Seguimiento: {a.get('seguimiento', 'N/A')}
     return "\n".join(parts)
 
 
+def calcular_score_ponderado(analyses: list[dict]) -> int:
+    """
+    Promedio ponderado de puntuacion_calidad usando screener_score como peso.
+    Refleja cuánto influyó cada paper en la búsqueda.
+    """
+    total_peso = sum(a.get("screener_score", 1) for a in analyses)
+    if total_peso == 0:
+        # fallback: promedio simple
+        scores = [a.get("puntuacion_calidad", 0) for a in analyses]
+        return int(sum(scores) / len(scores)) if scores else 0
+
+    score_ponderado = sum(
+        a.get("puntuacion_calidad", 0) * a.get("screener_score", 1)
+        for a in analyses
+    ) / total_peso
+
+    return int(score_ponderado)
+
+
 @router.post("/chat", dependencies=[Depends(verify_key)])
 async def pacientes_chat(req: PatientRequest):
-    """
-    Pipeline completo para pacientes:
-    1. Claude transforma pregunta del paciente a query PubMed
-    2. Busca papers en PubMed
-    3. Analiza los top 3 por score
-    4. Claude responde en lenguaje simple basado en la evidencia
-    """
     query = req.query.strip()
     if len(query) < 3:
         raise HTTPException(status_code=422, detail="Query demasiado corta.")
 
     client = get_client()
 
-    # 1. Transformar query del paciente a query PubMed
+    # 1. Transformar query
     try:
         pubmed_query = await transform_query_to_pubmed(query, client)
-        print(f"[Pacientes] Query original: '{query}' → PubMed: '{pubmed_query}'")
+        print(f"[Pacientes] Query: '{query}' → PubMed: '{pubmed_query}'")
     except Exception as e:
-        pubmed_query = query  # fallback a query original
-        print(f"[Pacientes] Error transformando query, usando original: {e}")
+        pubmed_query = query
+        print(f"[Pacientes] Error transformando query: {e}")
 
     # 2. Buscar papers
     try:
@@ -179,11 +187,11 @@ async def pacientes_chat(req: PatientRequest):
     if not papers:
         raise HTTPException(status_code=404, detail="No se encontraron papers para esta consulta.")
 
-    # 3. Ordenar por score y tomar top 3
+    # 3. Top 3 por score
     papers_sorted = sorted(papers, key=lambda p: p.get("score", 0), reverse=True)
     top_papers = papers_sorted[:3]
 
-    # 4. Analizar los 3 en paralelo
+    # 4. Analizar en paralelo
     analyses_raw = await asyncio.gather(*[analyze_paper_safe(p) for p in top_papers])
     analyses = [a for a in analyses_raw if a is not None]
 
@@ -192,7 +200,10 @@ async def pacientes_chat(req: PatientRequest):
 
     analyses.sort(key=lambda a: a.get("puntuacion_calidad", 0), reverse=True)
 
-    # 5. Construir contexto y responder en streaming
+    # 5. Calcular score ponderado
+    score_ponderado = calcular_score_ponderado(analyses)
+
+    # 6. Construir contexto
     context = build_context_from_analyses(analyses)
     user_message = f"""El paciente pregunta: {query}
 
@@ -209,13 +220,18 @@ Explícale al paciente en lenguaje simple qué dice esta evidencia científica s
             "nivel_evidencia_oxford": a.get("nivel_evidencia_oxford", ""),
             "calidad_grade": a.get("calidad_grade", ""),
             "puntuacion_calidad": a.get("puntuacion_calidad", 0),
+            "screener_score": a.get("screener_score", 0),
             "doi": a.get("doi", ""),
         }
         for a in analyses
     ]
 
     def generate():
-        meta_chunk = json.dumps({"type": "papers_meta", "papers": papers_meta}, ensure_ascii=False)
+        meta_chunk = json.dumps({
+            "type": "papers_meta",
+            "papers": papers_meta,
+            "score_ponderado": score_ponderado,
+        }, ensure_ascii=False)
         yield f"data: {meta_chunk}\n\n"
 
         with client.messages.stream(
