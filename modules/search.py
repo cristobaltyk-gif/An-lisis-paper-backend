@@ -1,6 +1,7 @@
 import httpx
 import fitz  # PyMuPDF
 from typing import Optional
+from modules.screener import score_paper
 
 HEADERS = {"User-Agent": "EvidenciaMed/1.0 (mailto:contacto@cleversalud.cl)"}
 
@@ -63,7 +64,7 @@ async def fetch_unpaywall(doi: str) -> Optional[str]:
 async def search_pubmed(query: str, max_results: int = 10) -> list[dict]:
     """
     Busca papers en PubMed por término clínico.
-    Devuelve lista de {pmid, title, authors, journal, year, abstract, doi}.
+    Devuelve lista rankeada con score calculado.
     """
     base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 
@@ -82,15 +83,7 @@ async def search_pubmed(query: str, max_results: int = 10) -> list[dict]:
         if not ids:
             return []
 
-        # 2. Obtener detalles
-        fetch = await c.get(f"{base}/efetch.fcgi", params={
-            "db": "pubmed",
-            "id": ",".join(ids),
-            "retmode": "json",
-            "rettype": "abstract",
-        }, headers=HEADERS)
-
-    # 3. PubMed efetch en JSON no existe — usar esummary
+    # 2. Obtener detalles via esummary
     async with httpx.AsyncClient(timeout=15) as c:
         summary = await c.get(f"{base}/esummary.fcgi", params={
             "db": "pubmed",
@@ -101,6 +94,7 @@ async def search_pubmed(query: str, max_results: int = 10) -> list[dict]:
             return []
         result_data = summary.json().get("result", {})
 
+    # 3. Construir papers con score
     papers = []
     for pmid in ids:
         item = result_data.get(pmid, {})
@@ -117,13 +111,18 @@ async def search_pubmed(query: str, max_results: int = 10) -> list[dict]:
             ),
             None,
         )
-        papers.append({
+        paper = {
             "pmid": pmid,
             "title": item.get("title", ""),
             "authors": authors,
             "journal": item.get("source", ""),
             "year": item.get("pubdate", "")[:4],
             "doi": doi,
-        })
+            "abstract": "",
+            "open_access": doi is not None,
+        }
+        paper["score"] = score_paper(paper)
+        papers.append(paper)
 
-    return papers
+    # 4. Ordenar por score descendente
+    return sorted(papers, key=lambda x: x["score"], reverse=True)
