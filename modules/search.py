@@ -8,6 +8,7 @@ from modules.screener import score_paper
 HEADERS = {"User-Agent": "EvidenciaMed/1.0 (mailto:contacto@cleversalud.cl)"}
 
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""))
+MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 
 def clean_doi(raw: str) -> str:
@@ -27,7 +28,7 @@ async def translate_to_english(query: str) -> str:
     """
     try:
         message = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=MODEL,
             max_tokens=100,
             system=(
                 "Eres un traductor especializado en terminología médica. "
@@ -162,4 +163,4 @@ async def search_pubmed(query: str, max_results: int = 10) -> list[dict]:
 
     # 4. Ordenar por score descendente
     return sorted(papers, key=lambda x: x["score"], reverse=True)
-    
+            
