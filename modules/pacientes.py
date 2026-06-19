@@ -18,6 +18,9 @@ router = APIRouter(prefix="/pacientes", tags=["pacientes"])
 API_KEY = os.getenv("EVIDENCIAMED_API_KEY", "")
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
 
+MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+
+
 async def verify_key(key: str = Security(api_key_header)):
     if not API_KEY or key != API_KEY:
         raise HTTPException(status_code=403, detail="API key inválida")
@@ -73,7 +76,7 @@ def get_client() -> anthropic.Anthropic:
 
 async def transform_query_to_pubmed(patient_query: str, client: anthropic.Anthropic) -> str:
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model=MODEL,
         max_tokens=100,
         system="""Eres un experto en búsqueda de literatura médica.
 Tu única tarea es convertir la pregunta de un paciente en una query corta y precisa para buscar en PubMed.
@@ -235,7 +238,7 @@ Explícale al paciente en lenguaje simple qué dice esta evidencia científica s
         yield f"data: {meta_chunk}\n\n"
 
         with client.messages.stream(
-            model="claude-sonnet-4-20250514",
+            model=MODEL,
             max_tokens=1500,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_message}],
@@ -250,4 +253,5 @@ Explícale al paciente en lenguaje simple qué dice esta evidencia científica s
         generate(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+                                    )
+                             
