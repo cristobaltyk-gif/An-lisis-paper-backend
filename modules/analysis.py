@@ -53,14 +53,39 @@ def build_content(meta: dict, doi: str, fulltext: str | None, fuente: str = "abs
 
 
 async def analyze(content: str) -> dict:
-    """Llama a Claude y devuelve el JSON parseado."""
+    """Llama a Claude y devuelve el JSON parseado.
+
+    Si la respuesta llega truncada (JSON incompleto por límite de tokens),
+    reintenta una vez pidiendo una versión más concisa para evitar el corte.
+    """
     message = client.messages.create(
         model=MODEL,
-        max_tokens=2000,
+        max_tokens=4096,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": content}],
     )
     raw = message.content[0].text
     clean = raw.replace("```json", "").replace("```", "").strip()
-    return json.loads(clean)
-  
+
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        # La respuesta se cortó antes de cerrar el JSON (texto muy largo).
+        # Reintentamos una vez pidiendo explícitamente que sea más breve.
+        retry_content = (
+            content
+            + "\n\nIMPORTANTE: tu respuesta anterior se cortó por exceder el límite "
+            + "de longitud. Responde de forma MÁS BREVE en cada campo de texto "
+            + "(especialmente resumen_ejecutivo, conclusion_critica y aplicabilidad_*), "
+            + "manteniendo el JSON completo y válido."
+        )
+        message_retry = client.messages.create(
+            model=MODEL,
+            max_tokens=4096,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": retry_content}],
+        )
+        raw_retry = message_retry.content[0].text
+        clean_retry = raw_retry.replace("```json", "").replace("```", "").strip()
+        return json.loads(clean_retry)
+      
