@@ -3,6 +3,7 @@ import json
 import anthropic
 
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""))
+MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 SYSTEM_PROMPT = """Eres un experto en medicina basada en evidencia y metodología de investigación científica clínica.
 Analiza el artículo científico y devuelve EXCLUSIVAMENTE un JSON válido con esta estructura exacta, sin texto adicional:
@@ -54,7 +55,7 @@ def build_content(meta: dict, doi: str, fulltext: str | None, fuente: str = "abs
 async def analyze(content: str) -> dict:
     """Llama a Claude y devuelve el JSON parseado."""
     message = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model=MODEL,
         max_tokens=2000,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": content}],
@@ -62,3 +63,4 @@ async def analyze(content: str) -> dict:
     raw = message.content[0].text
     clean = raw.replace("```json", "").replace("```", "").strip()
     return json.loads(clean)
+  
