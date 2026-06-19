@@ -1,9 +1,13 @@
+import os
 import httpx
 import fitz  # PyMuPDF
+import anthropic
 from typing import Optional
 from modules.screener import score_paper
 
 HEADERS = {"User-Agent": "EvidenciaMed/1.0 (mailto:contacto@cleversalud.cl)"}
+
+client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""))
 
 
 def clean_doi(raw: str) -> str:
@@ -14,6 +18,34 @@ def clean_doi(raw: str) -> str:
             doi = doi[len(prefix):]
             break
     return doi
+
+
+async def translate_to_english(query: str) -> str:
+    """
+    Traduce un término de búsqueda clínico a inglés para PubMed.
+    Si el query ya está en inglés o falla la traducción, devuelve el original.
+    """
+    try:
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=100,
+            system=(
+                "Eres un traductor especializado en terminología médica. "
+                "Traduce el siguiente término de búsqueda al inglés, usando "
+                "terminología médica/MeSH estándar (ej: 'prótesis de cadera' -> "
+                "'hip arthroplasty', 'artritis reumatoide' -> 'rheumatoid arthritis'). "
+                "Si ya está en inglés, devuélvelo igual. "
+                "Responde EXCLUSIVAMENTE con el término traducido, sin comillas, "
+                "sin explicaciones, sin texto adicional."
+            ),
+            messages=[{"role": "user", "content": query}],
+        )
+        translated = message.content[0].text.strip()
+        return translated if translated else query
+    except Exception:
+        # Si falla la traducción (sin API key, error de red, etc.),
+        # se sigue con el query original para no romper la búsqueda.
+        return query
 
 
 async def fetch_crossref(doi: str) -> dict:
@@ -64,15 +96,19 @@ async def fetch_unpaywall(doi: str) -> Optional[str]:
 async def search_pubmed(query: str, max_results: int = 10) -> list[dict]:
     """
     Busca papers en PubMed por término clínico.
+    Traduce automáticamente el término a inglés antes de buscar,
+    ya que PubMed está indexado principalmente en inglés.
     Devuelve lista rankeada con score calculado.
     """
     base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+
+    query_en = await translate_to_english(query)
 
     # 1. Buscar IDs
     async with httpx.AsyncClient(timeout=15) as c:
         search = await c.get(f"{base}/esearch.fcgi", params={
             "db": "pubmed",
-            "term": query,
+            "term": query_en,
             "retmax": max_results,
             "retmode": "json",
             "sort": "relevance",
@@ -126,3 +162,4 @@ async def search_pubmed(query: str, max_results: int = 10) -> list[dict]:
 
     # 4. Ordenar por score descendente
     return sorted(papers, key=lambda x: x["score"], reverse=True)
+    
