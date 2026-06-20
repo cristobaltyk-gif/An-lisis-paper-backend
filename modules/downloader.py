@@ -1,9 +1,12 @@
+import os
 import httpx
 import fitz  # PyMuPDF
 from typing import Optional
 
 HEADERS = {"User-Agent": "EvidenciaMed/1.0 (mailto:contacto@cleversalud.cl)"}
 EMAIL   = "contacto@cleversalud.cl"
+
+ELSEVIER_API_KEY = os.getenv("ELSEVIER_API_KEY")
 
 
 async def _pdf_to_text(content: bytes) -> Optional[str]:
@@ -15,6 +18,46 @@ async def _pdf_to_text(content: bytes) -> Optional[str]:
         return text[:15000] if text.strip() else None
     except Exception:
         return None
+
+
+async def from_elsevier(doi: str) -> Optional[str]:
+    """
+    Descarga texto completo directamente desde la API de Elsevier (ScienceDirect TDM)
+    usando ELSEVIER_API_KEY. Solo aplica a DOIs con prefijo 10.1016 (Elsevier).
+    Intenta primero texto plano; si no, XML completo.
+    """
+    if not ELSEVIER_API_KEY or not doi:
+        return None
+    if not doi.startswith("10.1016"):
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            url = f"https://api.elsevier.com/content/article/doi/{doi}"
+            els_headers = {
+                **HEADERS,
+                "X-ELS-APIKey": ELSEVIER_API_KEY,
+                "Accept": "text/plain",
+            }
+            r = await c.get(url, headers=els_headers)
+
+            if r.status_code == 200 and len(r.text.strip()) > 500:
+                return r.text.strip()[:15000]
+
+            if r.status_code in (401, 403, 404):
+                return None
+
+            # Reintento solicitando XML completo si texto plano no vino bien
+            els_headers["Accept"] = "application/xml"
+            r_xml = await c.get(url, headers=els_headers)
+            if r_xml.status_code == 200 and len(r_xml.text.strip()) > 500:
+                import re
+                text = re.sub(r'<[^>]+>', ' ', r_xml.text)
+                text = re.sub(r'\s+', ' ', text).strip()
+                return text[:15000] if len(text) > 500 else None
+    except Exception:
+        pass
+    return None
 
 
 async def from_unpaywall(doi: str) -> Optional[str]:
@@ -125,26 +168,32 @@ async def from_europepmc(doi: str) -> Optional[str]:
 async def get_fulltext(doi: str = None, pmid: str = None) -> tuple[Optional[str], str]:
     """
     Estrategia completa de descarga en orden de preferencia:
-    1. Unpaywall  → PDF open access
-    2. PMC        → texto completo gratuito
-    3. Europe PMC → cobertura adicional
-    4. None       → solo abstract disponible
+    1. Elsevier   → API directa con ELSEVIER_API_KEY (solo DOIs 10.1016)
+    2. Unpaywall  → PDF open access
+    3. PMC        → texto completo gratuito
+    4. Europe PMC → cobertura adicional
+    5. None       → solo abstract disponible
 
     Retorna (texto, fuente) donde fuente es:
-    'unpaywall' | 'pmc' | 'europepmc' | 'abstract'
+    'elsevier' | 'unpaywall' | 'pmc' | 'europepmc' | 'abstract'
     """
     if doi:
-        # 1. Unpaywall
+        # 1. Elsevier directo (solo si aplica el prefijo y hay API key)
+        text = await from_elsevier(doi)
+        if text and len(text) > 500:
+            return text, "elsevier"
+
+        # 2. Unpaywall
         text = await from_unpaywall(doi)
         if text and len(text) > 500:
             return text, "unpaywall"
 
-        # 2. PMC
+        # 3. PMC
         text = await from_pmc(doi=doi)
         if text and len(text) > 500:
             return text, "pmc"
 
-        # 3. Europe PMC
+        # 4. Europe PMC
         text = await from_europepmc(doi)
         if text and len(text) > 500:
             return text, "europepmc"
@@ -166,4 +215,4 @@ def sciencedirect_url(doi: str) -> str:
 def pubmed_url(pmid: str) -> str:
     """URL directa al paper en PubMed."""
     return f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
-                                                
+        
