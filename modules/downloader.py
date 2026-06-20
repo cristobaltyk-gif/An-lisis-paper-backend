@@ -41,6 +41,12 @@ async def from_elsevier(doi: str) -> Optional[str]:
             }
             r = await c.get(url, headers=els_headers)
 
+            print(f"[ELSEVIER DEBUG] DOI={doi}")
+            print(f"[ELSEVIER DEBUG] status_code={r.status_code}")
+            print(f"[ELSEVIER DEBUG] response_headers={dict(r.headers)}")
+            print(f"[ELSEVIER DEBUG] body_length={len(r.text)}")
+            print(f"[ELSEVIER DEBUG] body_preview={r.text[:300]!r}")
+
             if r.status_code == 200 and len(r.text.strip()) > 500:
                 return r.text.strip()[:15000]
 
@@ -50,12 +56,18 @@ async def from_elsevier(doi: str) -> Optional[str]:
             # Reintento solicitando XML completo si texto plano no vino bien
             els_headers["Accept"] = "application/xml"
             r_xml = await c.get(url, headers=els_headers)
+
+            print(f"[ELSEVIER DEBUG] retry_xml_status_code={r_xml.status_code}")
+            print(f"[ELSEVIER DEBUG] retry_xml_body_length={len(r_xml.text)}")
+            print(f"[ELSEVIER DEBUG] retry_xml_body_preview={r_xml.text[:300]!r}")
+
             if r_xml.status_code == 200 and len(r_xml.text.strip()) > 500:
                 import re
                 text = re.sub(r'<[^>]+>', ' ', r_xml.text)
                 text = re.sub(r'\s+', ' ', text).strip()
                 return text[:15000] if len(text) > 500 else None
-    except Exception:
+    except Exception as e:
+        print(f"[ELSEVIER DEBUG] EXCEPTION: {type(e).__name__}: {e}")
         pass
     return None
 
@@ -215,4 +227,4 @@ def sciencedirect_url(doi: str) -> str:
 def pubmed_url(pmid: str) -> str:
     """URL directa al paper en PubMed."""
     return f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
-        
+                
