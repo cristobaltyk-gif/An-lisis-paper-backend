@@ -13,6 +13,7 @@ from modules.downloader import get_fulltext
 from modules.screener import run_screener, load_screener, STREAMS
 from modules.memory import mark_as_read, get_all_read, clear_read
 from modules.pacientes import router as pacientes_router
+from modules.document_generator import generate_document, verify_document_key
 
 async def scheduled_screener():
     while True:
@@ -44,6 +45,16 @@ async def verify_key(key: str = Security(api_key_header)):
         raise HTTPException(status_code=403, detail="API key inválida")
     return key
 
+# Clave separada, exclusiva para el endpoint /generate/document.
+# Solo la usa el backend de Examen Musculoesquelético (server-to-server),
+# nunca el frontend de interrogadores directamente.
+document_key_header = APIKeyHeader(name="X-Document-Key", auto_error=True)
+
+async def verify_doc_key(key: str = Security(document_key_header)):
+    if not verify_document_key(key):
+        raise HTTPException(status_code=403, detail="Document key inválida")
+    return key
+
 class DoiRequest(BaseModel):
     doi: str
 
@@ -58,6 +69,11 @@ class SearchRequest(BaseModel):
 class ReadRequest(BaseModel):
     pmid: str
     stream: str
+
+class DocumentRequest(BaseModel):
+    papers: list[dict]
+    tema: str
+    autor: Optional[str] = None
 
 @app.get("/health")
 async def health():
@@ -135,3 +151,15 @@ async def clear_stream_read(stream: str):
         raise HTTPException(status_code=404, detail="Stream inválido.")
     clear_read(stream)
     return {"status": "ok", "stream": stream}
+
+@app.post("/generate/document", dependencies=[Depends(verify_doc_key)])
+async def generate_document_endpoint(req: DocumentRequest):
+    if not req.papers:
+        raise HTTPException(status_code=422, detail="Se requiere al menos un paper analizado.")
+    if len(req.tema.strip()) < 3:
+        raise HTTPException(status_code=422, detail="Tema demasiado corto.")
+    try:
+        resultado = await generate_document(req.papers, req.tema.strip(), req.autor or "")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return resultado
