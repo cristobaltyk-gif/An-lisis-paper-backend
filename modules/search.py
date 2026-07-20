@@ -1,4 +1,6 @@
 import os
+import json
+import asyncio
 import httpx
 import fitz  # PyMuPDF
 import anthropic
@@ -21,32 +23,39 @@ def clean_doi(raw: str) -> str:
     return doi
 
 
-async def translate_to_english(query: str) -> str:
+async def generate_search_variants(query: str, n: int = 4) -> list[str]:
     """
-    Traduce un término de búsqueda clínico a inglés para PubMed.
-    Si el query ya está en inglés o falla la traducción, devuelve el original.
+    A partir del término de búsqueda del usuario (en cualquier idioma), genera
+    varias variantes de búsqueda en inglés con terminología médica/MeSH
+    estándar y sinónimos clínicos relevantes — no solo una traducción directa,
+    sino distintos ángulos del mismo tema (término más amplio, más específico,
+    sinónimo aceptado), para ampliar la cobertura de la búsqueda en PubMed.
+    Si falla, devuelve una lista con solo el término original (fallback seguro).
     """
     try:
         message = client.messages.create(
             model=MODEL,
-            max_tokens=100,
+            max_tokens=250,
             system=(
-                "Eres un traductor especializado en terminología médica. "
-                "Traduce el siguiente término de búsqueda al inglés, usando "
-                "terminología médica/MeSH estándar (ej: 'prótesis de cadera' -> "
-                "'hip arthroplasty', 'artritis reumatoide' -> 'rheumatoid arthritis'). "
-                "Si ya está en inglés, devuélvelo igual. "
-                "Responde EXCLUSIVAMENTE con el término traducido, sin comillas, "
-                "sin explicaciones, sin texto adicional."
+                "Eres un experto en búsqueda bibliográfica médica (PubMed/MeSH). "
+                f"A partir del término de búsqueda del usuario, genera {n} variantes de "
+                "búsqueda en inglés, usando terminología médica/MeSH estándar y sinónimos "
+                "clínicos relevantes (ej: término MeSH directo, sinónimo clínico aceptado, "
+                "término más específico, término relacionado). No repitas variantes "
+                "prácticamente idénticas entre sí. "
+                "Responde EXCLUSIVAMENTE con un JSON de lista de strings, sin texto "
+                'adicional ni markdown: ["variante 1", "variante 2", "variante 3", "variante 4"]'
             ),
             messages=[{"role": "user", "content": query}],
         )
-        translated = message.content[0].text.strip()
-        return translated if translated else query
+        raw = message.content[0].text.strip()
+        clean = raw.replace("```json", "").replace("```", "").strip()
+        variantes = json.loads(clean)
+        if isinstance(variantes, list) and variantes:
+            return [str(v).strip() for v in variantes[:n] if str(v).strip()]
     except Exception:
-        # Si falla la traducción (sin API key, error de red, etc.),
-        # se sigue con el query original para no romper la búsqueda.
-        return query
+        pass
+    return [query]
 
 
 async def fetch_crossref(doi: str) -> dict:
@@ -94,22 +103,14 @@ async def fetch_unpaywall(doi: str) -> Optional[str]:
     return None
 
 
-async def search_pubmed(query: str, max_results: int = 10) -> list[dict]:
-    """
-    Busca papers en PubMed por término clínico.
-    Traduce automáticamente el término a inglés antes de buscar,
-    ya que PubMed está indexado principalmente en inglés.
-    Devuelve lista rankeada con score calculado.
-    """
+async def _fetch_pubmed_variant(query: str, max_results: int) -> list[dict]:
+    """Ejecuta esearch + esummary para UNA variante de búsqueda puntual."""
     base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 
-    query_en = await translate_to_english(query)
-
-    # 1. Buscar IDs
     async with httpx.AsyncClient(timeout=15) as c:
         search = await c.get(f"{base}/esearch.fcgi", params={
             "db": "pubmed",
-            "term": query_en,
+            "term": query,
             "retmax": max_results,
             "retmode": "json",
             "sort": "relevance",
@@ -120,8 +121,6 @@ async def search_pubmed(query: str, max_results: int = 10) -> list[dict]:
         if not ids:
             return []
 
-    # 2. Obtener detalles via esummary
-    async with httpx.AsyncClient(timeout=15) as c:
         summary = await c.get(f"{base}/esummary.fcgi", params={
             "db": "pubmed",
             "id": ",".join(ids),
@@ -131,7 +130,6 @@ async def search_pubmed(query: str, max_results: int = 10) -> list[dict]:
             return []
         result_data = summary.json().get("result", {})
 
-    # 3. Construir papers con score
     papers = []
     for pmid in ids:
         item = result_data.get(pmid, {})
@@ -148,7 +146,7 @@ async def search_pubmed(query: str, max_results: int = 10) -> list[dict]:
             ),
             None,
         )
-        paper = {
+        papers.append({
             "pmid": pmid,
             "title": item.get("title", ""),
             "authors": authors,
@@ -157,10 +155,34 @@ async def search_pubmed(query: str, max_results: int = 10) -> list[dict]:
             "doi": doi,
             "abstract": "",
             "open_access": doi is not None,
-        }
-        paper["score"] = score_paper(paper)
-        papers.append(paper)
+        })
+    return papers
 
-    # 4. Ordenar por score descendente
-    return sorted(papers, key=lambda x: x["score"], reverse=True)
-            
+
+async def search_pubmed(query: str, max_results: int = 10) -> list[dict]:
+    """
+    Busca papers en PubMed usando VARIAS variantes MeSH/sinónimos del término
+    original (generadas por Claude vía generate_search_variants), en paralelo.
+    Fusiona los resultados por PMID (sin duplicados), puntúa cada paper con
+    score_paper() — el mismo sistema que usa el Radar de Literatura — y
+    devuelve ordenado por score descendente, cortado a max_results.
+    """
+    variantes = await generate_search_variants(query, n=4)
+
+    resultados_por_variante = await asyncio.gather(
+        *(_fetch_pubmed_variant(v, max_results) for v in variantes)
+    )
+
+    fusion: dict[str, dict] = {}
+    for lista in resultados_por_variante:
+        for paper in lista:
+            pmid = paper["pmid"]
+            if pmid not in fusion:
+                fusion[pmid] = paper
+
+    for paper in fusion.values():
+        paper["score"] = score_paper(paper)
+
+    ranked = sorted(fusion.values(), key=lambda x: x["score"], reverse=True)
+    return ranked[:max_results]
+                                
