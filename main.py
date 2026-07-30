@@ -7,7 +7,7 @@ from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 from typing import Optional
 
-from modules.search import clean_doi, fetch_crossref, search_pubmed
+from modules.search import clean_doi, fetch_crossref, search_pubmed, search_scielo
 from modules.analysis import build_content, analyze
 from modules.downloader import get_fulltext
 from modules.screener import run_screener, load_screener, STREAMS
@@ -110,7 +110,23 @@ async def analyze_text(req: TextRequest):
 async def search_papers(req: SearchRequest):
     if len(req.query.strip()) < 3:
         raise HTTPException(status_code=422, detail="Query demasiado corta.")
-    papers = await search_pubmed(req.query, min(req.max_results, 20))
+
+    max_results = min(req.max_results, 20)
+
+    papers_pubmed, papers_scielo = await asyncio.gather(
+        search_pubmed(req.query, max_results),
+        search_scielo(req.query, max_results),
+    )
+
+    for p in papers_pubmed:
+        p.setdefault("fuente", "pubmed")
+
+    papers = sorted(
+        papers_pubmed + papers_scielo,
+        key=lambda x: x.get("score", 0),
+        reverse=True,
+    )[:max_results]
+
     return {"query": req.query, "total": len(papers), "papers": papers}
 
 @app.get("/screener/{stream}", dependencies=[Depends(verify_key)])
