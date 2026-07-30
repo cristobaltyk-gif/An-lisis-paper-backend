@@ -1,4 +1,7 @@
 import os
+import re
+import html as html_lib
+import asyncio
 import httpx
 import fitz  # PyMuPDF
 import anthropic
@@ -9,6 +12,13 @@ HEADERS = {"User-Agent": "EvidenciaMed/1.0 (mailto:contacto@cleversalud.cl)"}
 
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""))
 MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+
+# Credenciales de Google Custom Search (pendiente de contratar/configurar)
+GOOGLE_CSE_API_KEY = os.getenv("GOOGLE_CSE_API_KEY", "")
+GOOGLE_CSE_CX = os.getenv("GOOGLE_CSE_CX", "")
+
+# PID de SciELO: S + ISSN (9 chars, ej. 0102-311X) + 13 dígitos de sufijo
+SCIELO_PID_REGEX = re.compile(r"S\d{4}-\d{3}[0-9Xx]\d{13}")
 
 
 def clean_doi(raw: str) -> str:
@@ -163,4 +173,155 @@ async def search_pubmed(query: str, max_results: int = 10) -> list[dict]:
 
     # 4. Ordenar por score descendente
     return sorted(papers, key=lambda x: x["score"], reverse=True)
-            
+
+
+# ---------------------------------------------------------------------------
+# SciELO (colección Chile) — búsqueda por tema vía Google Custom Search
+# restringida a site:scielo.cl, resolución de metadatos + fulltext vía
+# la API oficial ArticleMeta (articlemeta.scielo.org).
+# ---------------------------------------------------------------------------
+
+async def _google_site_search(query: str, site: str, max_results: int) -> list[str]:
+    """Busca 'site:{site} {query}' en Google Custom Search y devuelve
+    la lista de URLs de resultado. Si no hay credenciales configuradas
+    (GOOGLE_CSE_API_KEY / GOOGLE_CSE_CX), devuelve lista vacía sin
+    romper el resto del flujo."""
+    if not GOOGLE_CSE_API_KEY or not GOOGLE_CSE_CX:
+        return []
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.get(
+            "https://www.googleapis.com/customsearch/v1",
+            params={
+                "key": GOOGLE_CSE_API_KEY,
+                "cx": GOOGLE_CSE_CX,
+                "q": f"site:{site} {query}",
+                "num": min(max_results, 10),
+            },
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        return [item.get("link", "") for item in data.get("items", []) if item.get("link")]
+
+
+def _extraer_pid_scielo(url: str) -> Optional[str]:
+    """Extrae el PID (código de artículo SciELO) de una URL de resultado."""
+    match = SCIELO_PID_REGEX.search(url)
+    return match.group(0) if match else None
+
+
+async def _resolver_pid_scielo(pid: str) -> Optional[dict]:
+    """Resuelve un PID contra la API ArticleMeta, colección Chile fija."""
+    url = f"https://articlemeta.scielo.org/api/v1/article/?code={pid}&collection=chl"
+    async with httpx.AsyncClient(timeout=20) as c:
+        try:
+            r = await c.get(url, headers=HEADERS)
+        except httpx.RequestError:
+            return None
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not data or not data.get("code"):
+            return None
+        return data
+
+
+async def _extraer_fulltext_html(html_url: str) -> str:
+    """Descarga el HTML del artículo y extrae texto plano (sin bs4:
+    quita script/style, quita tags, decodifica entidades)."""
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
+        try:
+            r = await c.get(html_url, headers=HEADERS)
+        except httpx.RequestError:
+            return ""
+        if r.status_code != 200:
+            return ""
+    text = re.sub(r"(?is)<(script|style).*?>.*?(</\1>)", "", r.text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html_lib.unescape(text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text)
+    return text.strip()[:15000]
+
+
+async def _armar_paper_scielo(meta: dict) -> Optional[dict]:
+    """Convierte un registro crudo de ArticleMeta (ISIS2JSON) al mismo
+    shape que devuelve search_pubmed, agregando fulltext y fuente."""
+    if not meta:
+        return None
+
+    article = meta.get("article", {})
+
+    titulo = ""
+    for t in article.get("v12", []):
+        if t.get("l") == "es":
+            titulo = t.get("_", "")
+            break
+    if not titulo and article.get("v12"):
+        titulo = article["v12"][0].get("_", "")
+
+    autores = ", ".join(
+        f"{a.get('n','')} {a.get('s','')}".strip()
+        for a in article.get("v10", [])[:4]
+        if a.get("s")
+    )
+
+    revista = ""
+    if article.get("v30"):
+        revista = article["v30"][0].get("_", "")
+
+    year = str(meta.get("publication_year", ""))[:4]
+    doi = meta.get("doi", "")
+
+    html_links = meta.get("fulltexts", {}).get("html", {})
+    html_url = html_links.get("es") or html_links.get("pt") or html_links.get("en")
+    if not html_url and html_links:
+        html_url = next(iter(html_links.values()))
+
+    fulltext = await _extraer_fulltext_html(html_url) if html_url else ""
+
+    paper = {
+        "pmid": None,
+        "title": titulo,
+        "authors": autores,
+        "journal": revista,
+        "year": year,
+        "doi": doi,
+        "abstract": "",
+        "open_access": True,
+        "fuente": "scielo",
+        "fulltext": fulltext,
+    }
+    paper["score"] = score_paper(paper)
+    return paper
+
+
+async def search_scielo(query: str, max_results: int = 10) -> list[dict]:
+    """
+    Busca papers en SciELO (colección Chile) por tema, vía Google Custom
+    Search restringido a site:scielo.cl (search.scielo.org bloquea con
+    proof-of-work y no es accesible server-to-server).
+
+    Resuelve cada resultado por su PID contra la API oficial ArticleMeta
+    y extrae el fulltext en HTML directo (SciELO es open access, no
+    requiere Unpaywall/Elsevier). Devuelve lista rankeada con score,
+    mismo shape que search_pubmed más los campos "fuente" y "fulltext".
+    """
+    urls = await _google_site_search(query, "scielo.cl", max_results)
+
+    pids = []
+    vistos = set()
+    for u in urls:
+        pid = _extraer_pid_scielo(u)
+        if pid and pid not in vistos:
+            vistos.add(pid)
+            pids.append(pid)
+
+    if not pids:
+        return []
+
+    metas = await asyncio.gather(*(_resolver_pid_scielo(p) for p in pids))
+    papers = await asyncio.gather(*(_armar_paper_scielo(m) for m in metas))
+    papers = [p for p in papers if p]
+
+    return sorted(papers, key=lambda x: x["score"], reverse=True)
