@@ -14,6 +14,11 @@ a la síntesis del documento.
 La sección de Epidemiología internacional y nacional es la única que se
 nutre de una búsqueda PubMed adicional (vía modules.search.search_pubmed),
 independiente de los papers marcados por el interrogador.
+
+Los papers marcados pueden venir de PubMed (sin fulltext propio, se resuelve
+por DOI/PMID vía get_fulltext) o de SciELO (ya traen el campo "fulltext"
+extraído en la búsqueda misma, por ser open access — en ese caso se usa
+directo, sin llamar a get_fulltext).
 """
 
 import os
@@ -66,8 +71,14 @@ Reglas estrictas:
 
 
 async def _obtener_texto_paper(paper: dict) -> str:
-    """Intenta obtener texto completo del paper (por DOI o PMID);
-    si no hay disponible, retorna solo un aviso de metadatos."""
+    """Obtiene el texto del paper. Si ya viene con fulltext incluido
+    (caso SciELO, extraído directo en la búsqueda por ser open access),
+    lo usa tal cual sin llamar a get_fulltext. Si no, intenta resolverlo
+    por DOI o PMID (caso PubMed) como antes."""
+    fulltext_incluido = (paper.get("fulltext") or "").strip()
+    if fulltext_incluido:
+        return fulltext_incluido
+
     doi = paper.get("doi")
     pmid = paper.get("pmid")
 
