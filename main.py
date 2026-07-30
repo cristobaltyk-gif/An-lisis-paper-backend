@@ -108,6 +108,14 @@ async def analyze_text(req: TextRequest):
 
 @app.post("/search", dependencies=[Depends(verify_key)])
 async def search_papers(req: SearchRequest):
+    """
+    Busca en PubMed y SciELO EN PARALELO, cada una hasta max_results
+    (tope de 20 por fuente, no combinado). Se muestran TODOS los
+    resultados de ambas fuentes juntos, ordenados por score de mayor
+    a menor — sin recortar el total ni reservar cupos: si una fuente
+    trae menos que el tope (o nada), simplemente no se rellena con
+    más resultados de la otra.
+    """
     if len(req.query.strip()) < 3:
         raise HTTPException(status_code=422, detail="Query demasiado corta.")
 
@@ -125,7 +133,7 @@ async def search_papers(req: SearchRequest):
         papers_pubmed + papers_scielo,
         key=lambda x: x.get("score", 0),
         reverse=True,
-    )[:max_results]
+    )
 
     return {"query": req.query, "total": len(papers), "papers": papers}
 
