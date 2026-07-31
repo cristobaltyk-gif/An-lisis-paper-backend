@@ -13,9 +13,9 @@ HEADERS = {"User-Agent": "EvidenciaMed/1.0 (mailto:contacto@cleversalud.cl)"}
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""))
 MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
-# Credenciales de Google Custom Search (pendiente de contratar/configurar)
-GOOGLE_CSE_API_KEY = os.getenv("GOOGLE_CSE_API_KEY", "")
-GOOGLE_CSE_CX = os.getenv("GOOGLE_CSE_CX", "")
+# Credencial de SerpAPI (reemplaza a Google Custom Search, que quedó
+# cerrada para proyectos nuevos — ver historial de la implementación).
+SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
 
 # PID de SciELO: S + ISSN (9 chars, ej. 0102-311X) + 13 dígitos de sufijo
 SCIELO_PID_REGEX = re.compile(r"S\d{4}-\d{3}[0-9Xx]\d{13}")
@@ -176,32 +176,36 @@ async def search_pubmed(query: str, max_results: int = 10) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# SciELO (colección Chile) — búsqueda por tema vía Google Custom Search
+# SciELO (colección Chile) — búsqueda por tema vía SerpAPI (Google real),
 # restringida a site:scielo.cl, resolución de metadatos + fulltext vía
 # la API oficial ArticleMeta (articlemeta.scielo.org).
 # ---------------------------------------------------------------------------
 
-async def _google_site_search(query: str, site: str, max_results: int) -> list[str]:
-    """Busca 'site:{site} {query}' en Google Custom Search y devuelve
-    la lista de URLs de resultado. Si no hay credenciales configuradas
-    (GOOGLE_CSE_API_KEY / GOOGLE_CSE_CX), devuelve lista vacía sin
+async def _serpapi_site_search(query: str, site: str, max_results: int) -> list[str]:
+    """Busca 'site:{site} {query}' vía SerpAPI (resultados reales de
+    Google) y devuelve la lista de URLs de resultado. Si no hay
+    credencial configurada (SERPAPI_KEY), devuelve lista vacía sin
     romper el resto del flujo."""
-    if not GOOGLE_CSE_API_KEY or not GOOGLE_CSE_CX:
+    if not SERPAPI_KEY:
         return []
-    async with httpx.AsyncClient(timeout=15) as c:
+    async with httpx.AsyncClient(timeout=20) as c:
         r = await c.get(
-            "https://www.googleapis.com/customsearch/v1",
+            "https://serpapi.com/search.json",
             params={
-                "key": GOOGLE_CSE_API_KEY,
-                "cx": GOOGLE_CSE_CX,
+                "engine": "google",
                 "q": f"site:{site} {query}",
                 "num": min(max_results, 10),
+                "api_key": SERPAPI_KEY,
             },
         )
         if r.status_code != 200:
             return []
         data = r.json()
-        return [item.get("link", "") for item in data.get("items", []) if item.get("link")]
+        return [
+            item.get("link", "")
+            for item in data.get("organic_results", [])
+            if item.get("link")
+        ]
 
 
 def _extraer_pid_scielo(url: str) -> Optional[str]:
@@ -298,16 +302,15 @@ async def _armar_paper_scielo(meta: dict) -> Optional[dict]:
 
 async def search_scielo(query: str, max_results: int = 10) -> list[dict]:
     """
-    Busca papers en SciELO (colección Chile) por tema, vía Google Custom
-    Search restringido a site:scielo.cl (search.scielo.org bloquea con
-    proof-of-work y no es accesible server-to-server).
+    Busca papers en SciELO (colección Chile) por tema, vía SerpAPI
+    (resultados reales de Google) restringido a site:scielo.cl.
 
     Resuelve cada resultado por su PID contra la API oficial ArticleMeta
     y extrae el fulltext en HTML directo (SciELO es open access, no
     requiere Unpaywall/Elsevier). Devuelve lista rankeada con score,
     mismo shape que search_pubmed más los campos "fuente" y "fulltext".
     """
-    urls = await _google_site_search(query, "scielo.cl", max_results)
+    urls = await _serpapi_site_search(query, "scielo.cl", max_results)
 
     pids = []
     vistos = set()
